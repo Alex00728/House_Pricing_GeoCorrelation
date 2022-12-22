@@ -1,0 +1,207 @@
+---
+title: "Geospatial Correlation Analysis of House Pricing"
+author: "Alex Alvarez"
+date: "2022-11-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Carga de libraries
+```{r}
+set.seed(42) # Reproducibilidad
+pacman::p_load(rgdal, rgeos, stars, spatstat, spdep, sf, raster,
+               spatialreg, tidyverse, gstat, MASS, corrplot, patchwork)
+```
+
+## Datos Censo
+```{r}
+censo_iq <- readRDS("mz_censo17_iquique.rds")
+mz_iq <- censo_iq  %>% 
+  st_as_sf() %>%  
+  st_transform(32719)
+
+# imputación de escolaridad por la media
+mz_iq$JH_ESC_P[is.na(mz_iq$JH_ESC_P)] <- mean(mz_iq$JH_ESC_P,na.rm = TRUE)
+```
+
+## Raster Interpolando por Escolaridad
+```{r}
+gs <- gstat(formula = JH_ESC_P~1, locations = mz_iq)
+
+rast <- raster(mz_iq, res=30)
+
+idw <- interpolate(rast, gs)
+lim <- extent(idw) # para recuperar los límites del raster más adelante
+
+plot(idw, col = viridis::viridis(100), main='Escolaridad')
+
+
+```
+
+> Se aprecia Mayor escolaridad en la línea costera
+
+## Datos SII
+```{r}
+SII_iq <- readRDS("mz_SII_iquique.rds")
+mzs_iq <- SII_iq  %>% 
+  st_as_sf() %>%  
+  st_transform(32719)
+
+# Metros cuadrados de Com + Of
+mzs_iq$MtOfCom <- mzs_iq$oficinas + mzs_iq$comercio
+# Densidad: Com + Of / Area
+mzs_iq$OfComDens <- mzs_iq$MtOfCom / mzs_iq$AREA
+
+```
+
+
+## Raster kernel density para MtOfCom (puntos sobre el 5% del área de cada polígono)
+```{r}
+mzs_iqF <- mzs_iq[mzs_iq$OfComDens > 0.05,] #umbral para puntos de MtOfCom sobre 0.05 del Area
+
+pts <- st_centroid(mzs_iqF$geometry) %>% unlist() %>% matrix(nrow=2) %>% t()
+
+kden <- kde2d(pts[,1], pts[,2], h= 500, n = 100, lims = c(lim[1:2],lim[3:4]))
+image(kden, col = viridis::viridis(100), main='Comercio y Oficinas')
+
+```
+
+
+## Rasters Interpolando por Comercio + Oficinas y su Densidad
+```{r}
+gs2 <- gstat(formula = MtOfCom~1, locations = mzs_iq)
+gs3 <- gstat(formula = OfComDens~1, locations = mzs_iqF)
+
+rast2 <- raster(mzs_iq, res=30)
+
+idw2 <- interpolate(rast2, gs2)
+idw3 <- interpolate(rast2, gs3)
+
+plot(idw2, col = viridis::viridis(100), main='Metros cuadrados de Comercio y Oficinas')
+plot(idw3, col = viridis::viridis(100), main='Densidad de Comercio y Oficinas')
+
+```
+
+> Se asume que Densidad de Comercio + Oficinas representa de mejor manera la agregación de ambos datos, al estar estandarizado por el área del polígono del cual se extraen, por lo tanto, la interpolación de está deberá ser más representativa de la geoespacialidad
+
+## Carga de Data Tasación e imputación de los rasters anteriores
+```{r}
+tas_iq <- readRDS("tasacion_iquique.rds")  %>%
+            st_as_sf() %>%  
+            st_transform(32719)
+
+# imputación
+tas_iq$escolaridad <- raster::extract(idw, tas_iq) # Escolaridad
+tas_iq$MtOfCom <- raster::extract(idw2, tas_iq) # Metros cuadrados de Com + Ofs
+tas_iq$OfComDens <- raster::extract(idw3, tas_iq) # Densidad de Com + Ofs interpolada
+tas_iq$MtOfComK <- raster::extract(raster(kden), tas_iq) # kernel density para MtOfCom
+
+```
+
+## OLS
+```{r}
+m.ols <- lm(tasa_uf ~ sup_const + sup_terr + escolaridad + casa + ascensor + MtOfCom + MtOfComK + OfComDens, data = tas_iq)
+summary(m.ols)
+
+```
+
+
+## Matriz de Vecinos y error espacial
+```{r}
+nb <- nb2listw(neighbours = knn2nb(
+  knn = knearneigh(x = tas_iq, k = 5)), 
+  style = "W")
+# se alcanzó mayor autocorrelación con k = 5
+
+moran.test(m.ols$residuals, nb)
+```
+> El Índice de Moran es 0.2390 y el p-valor significativo, por lo que se puede asumir que existe autocorrelación espacial de la variable tasa_uf (medida con los residuos del modelo)
+
+
+## Modelos de regresion espacial
+### Con error espacial 
+```{r}
+# NOTA: se quitará MtOfComK correspondiente al kernel density, ya que no permite llevar a cabo los modelos de correlación espacial. 
+# Por otro lado, se asume que OfComDens representa de mejor manera tal variable al estar estandarizada por área del polígono
+
+m.err <- errorsarlm(tasa_uf ~ sup_const + sup_terr + escolaridad + casa + ascensor + MtOfCom + OfComDens, data 
+                    = tas_iq, listw = nb, etype="error", method="eigen")
+
+summary(m.err)
+moran.test(m.err$residuals, nb)
+```
+> El modelo con error espacial logra eliminar la autocorrelación espacial
+
+## Modelo con lag espacial
+```{r}
+m.lag <- lagsarlm(tasa_uf ~ sup_const + sup_terr + escolaridad + casa + ascensor + MtOfCom + OfComDens, 
+                  data = tas_iq, listw = nb, type="lag",method="eigen")
+
+summary(m.lag)
+moran.test(m.lag$residuals, nb)
+```
+> El incorporar al modelo el lag espacial no elimina la autocorrelación 
+(Moran I = 0.11427 y p-valor = 1.834e-05)
+
+## Modelo con error+lag espacial
+```{r}
+m.errlag <- sacsarlm(tasa_uf ~ sup_const + sup_terr + escolaridad + casa + ascensor + MtOfCom + OfComDens, 
+                     data = tas_iq, listw = nb, type="sac", method="eigen")
+
+summary(m.errlag)
+moran.test(m.errlag$residuals, nb)
+```
+> El modelo con error y lag espacial logra eliminar la autocorrelación (AIC: 7089.8, Moran I = -0.00200 y p-value = 0.495), con desempeño similar al modelo que solo incorpora error (AIC: 7116, Moran I = -0.00253 y p-value = 0.5025).
+Dado el similar desempeño se opta por el modelo con error y lag espacial al resultar este mejor puntuado por criterio de información Akaike.
+Considerado lo anterior, la variable de entorno con mayor impacto sobre el valor de viviendas es sup_terr (superficie del terreno) con valor-z de 22.5159 y valor-p menor a 2.2e-16.
+
+
+## Unión de los dataframes consevarvando poligonos y puntos para graficar modelos sobre los polígonos
+```{r}
+mz_iq <-  mz_iq %>% mutate(geomPol = geometry)
+
+join_iq  <- st_join(tas_iq, mz_iq, join = st_nearest_feature )
+
+F_iq  <-  join_iq %>% mutate(geomP = geometry,
+                          geometry = geomPol) %>% 
+                   dplyr::select(!c(geomPol))
+```
+
+## Agregación de las predicciones
+```{r}
+F_iq <- 
+  F_iq %>% 
+  mutate(reg_lin = predict(m.ols), 
+         errsar = fitted(m.err),
+         lagsar = fitted(m.lag),
+         sacsar = fitted(m.errlag))
+```
+## Gráfico
+```{r}
+p1 <- ggplot(data=F_iq) + 
+  geom_sf(aes(fill=reg_lin)) +
+  scale_fill_viridis_c()+ 
+  theme(axis.text = element_text(angle = 45, size = 7))
+
+p2 <- ggplot(data=F_iq) + 
+  geom_sf(aes(fill=errsar)) +
+  scale_fill_viridis_c()+ 
+  theme(axis.text = element_text(angle = 45, size = 7))
+
+p3 <- ggplot(data=F_iq) + 
+  geom_sf(aes(fill=lagsar)) +
+  scale_fill_viridis_c()+ 
+  theme(axis.text = element_text(angle = 45, size = 7))
+
+p4 <- ggplot(data=F_iq) + 
+  geom_sf(aes(fill=sacsar)) +
+  scale_fill_viridis_c()+ 
+  theme(axis.text = element_text(angle = 45, size = 7))
+
+(p1 + p2) / (p3 + p4)
+
+```
+
